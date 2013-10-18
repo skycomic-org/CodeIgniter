@@ -336,7 +336,7 @@ class CI_DB_active_record extends CI_DB_driver {
 			$cond = $match[1].$match[2].$match[3];
 		}
 
-		// Assemble the JOIN statement: only use ON if a condition was passed
+		// Assemble the JOIN statement
 		$join = $type.'JOIN '.$this->_protect_identifiers($table, TRUE, NULL, FALSE).' ON '.$cond;
 
 		$this->ar_join[] = $join;
