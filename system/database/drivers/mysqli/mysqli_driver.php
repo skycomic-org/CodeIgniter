@@ -311,13 +311,16 @@ class CI_DB_mysqli_driver extends CI_DB {
 			return $str;
 		}
 
+		if (!is_object($this->conn_id)) {
+			$this->db_connect();
+		}
 		if (function_exists('mysqli_real_escape_string') AND is_object($this->conn_id))
 		{
 			$str = mysqli_real_escape_string($this->conn_id, $str);
 		}
 		elseif (function_exists('mysql_escape_string'))
 		{
-			$str = mysql_escape_string($str);
+			$str = @mysql_escape_string($str);
 		}
 		else
 		{
@@ -548,9 +551,11 @@ class CI_DB_mysqli_driver extends CI_DB {
 	 * @param	array	the insert values
 	 * @return	string
 	 */
-	function _insert($table, $keys, $values)
+	function _insert($table, $keys, $values, $ignore)
 	{
-		return "INSERT INTO ".$table." (".implode(', ', $keys).") VALUES (".implode(', ', $values).")";
+		return $ignore ? 
+			"INSERT IGNORE INTO ".$table." (".implode(', ', $keys).") VALUES (".implode(', ', $values).")"
+			: "INSERT INTO ".$table." (".implode(', ', $keys).") VALUES (".implode(', ', $values).")";
 	}
 
 	// --------------------------------------------------------------------

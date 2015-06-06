@@ -499,6 +499,9 @@ class CI_Output {
 		@chmod($cache_path, FILE_WRITE_MODE);
 
 		log_message('debug', "Cache file written: ".$cache_path);
+
+		// Send HTTP cache-control headers to browser to match file cache settings.
+		$this->set_cache_header($_SERVER['REQUEST_TIME'], $expire);
 	}
 
 	// --------------------------------------------------------------------
@@ -513,60 +516,310 @@ class CI_Output {
 	 */
 	function _display_cache(&$CFG, &$URI)
 	{
-		$cache_path = ($CFG->item('cache_path') == '') ? APPPATH.'cache/' : $CFG->item('cache_path');
+		$cache_path = ($CFG->item('cache_path') === '') ? APPPATH.'cache/' : $CFG->item('cache_path');
 
-		// Build the file path.  The file name is an MD5 hash of the full URI
-		$uri =	$CFG->item('base_url').
-				$CFG->item('index_page').
-				$URI->uri_string;
-
+		// Build the file path. The file name is an MD5 hash of the full URI
+		$uri =	$CFG->item('base_url').$CFG->item('index_page').$URI->uri_string;
 		$filepath = $cache_path.md5($uri);
 
-		if ( ! @file_exists($filepath))
-		{
-			return FALSE;
-		}
-
-		if ( ! $fp = @fopen($filepath, FOPEN_READ))
+		if ( ! @file_exists($filepath) OR ! $fp = @fopen($filepath, FOPEN_READ))
 		{
 			return FALSE;
 		}
 
 		flock($fp, LOCK_SH);
 
-		$cache = '';
-		if (filesize($filepath) > 0)
-		{
-			$cache = fread($fp, filesize($filepath));
-		}
+		$cache = (filesize($filepath) > 0) ? fread($fp, filesize($filepath)) : '';
 
 		flock($fp, LOCK_UN);
 		fclose($fp);
 
-		// Strip out the embedded timestamp
-		if ( ! preg_match("/(\d+TS--->)/", $cache, $match))
+		// Look for embedded serialized file info.
+		if ( ! preg_match('/^(.*)ENDCI--->/', $cache, $match))
 		{
 			return FALSE;
 		}
 
-		// Has the file expired? If so we'll delete it.
-		if (time() >= trim(str_replace('TS--->', '', $match['1'])))
+		$cache_info = unserialize($match[1]);
+		$expire = $cache_info['expire'];
+
+		$last_modified = filemtime($cache_path);
+
+		// Has the file expired?
+		if ($_SERVER['REQUEST_TIME'] >= $expire && is_really_writable($cache_path))
 		{
-			if (is_really_writable($cache_path))
-			{
-				@unlink($filepath);
-				log_message('debug', "Cache file has expired. File deleted");
-				return FALSE;
-			}
+			// If so we'll delete it.
+			@unlink($filepath);
+			log_message('debug', 'Cache file has expired. File deleted.');
+			return FALSE;
+		}
+		else
+		{
+			// Or else send the HTTP cache control headers.
+			$this->set_cache_header($last_modified, $expire);
+		}
+
+		// Add headers from cache file.
+		foreach ($cache_info['headers'] as $header)
+		{
+			$this->set_header($header[0], $header[1]);
 		}
 
 		// Display the cache
-		$this->_display(str_replace($match['0'], '', $cache));
-		log_message('debug', "Cache file is current. Sending it to browser.");
+		$this->_display(substr($cache, strlen($match[0])));
+		log_message('debug', 'Cache file is current. Sending it to browser.');
 		return TRUE;
 	}
 
+	/**
+	 * Set Cache Header
+	 *
+	 * Set the HTTP headers to match the server-side file cache settings
+	 * in order to reduce bandwidth.
+	 *
+	 * @param	int	$last_modified	Timestamp of when the page was last modified
+	 * @param	int	$expiration	Timestamp of when should the requested page expire from cache
+	 * @return	void
+	 */
+	public function set_cache_header($last_modified, $expiration)
+	{
+		$max_age = $expiration - $_SERVER['REQUEST_TIME'];
 
+		if (isset($_SERVER['HTTP_IF_MODIFIED_SINCE']) && $last_modified <= strtotime($_SERVER['HTTP_IF_MODIFIED_SINCE']))
+		{
+			$this->set_status_header(304);
+			exit;
+		}
+		else
+		{
+			header('Pragma: public');
+			header('Cache-Control: max-age=' . $max_age . ', public');
+			header('Expires: '.gmdate('D, d M Y H:i:s', $expiration).' GMT');
+			header('Last-modified: '.gmdate('D, d M Y H:i:s', $last_modified).' GMT');
+		}
+	}
+	// --------------------------------------------------------------------
+
+	/**
+	 * Minify
+	 *
+	 * Reduce excessive size of HTML/CSS/JavaScript content.
+	 *
+	 * @param	string	$output	Output to minify
+	 * @param	string	$type	Output content MIME type
+	 * @return	string	Minified output
+	 */
+	public function minify($output, $type = 'text/html')
+	{
+		switch ($type)
+		{
+			case 'text/html':
+
+				if (($size_before = strlen($output)) === 0)
+				{
+					return '';
+				}
+
+				// Find all the <pre>,<code>,<textarea>, and <javascript> tags
+				// We'll want to return them to this unprocessed state later.
+				preg_match_all('{<pre.+</pre>}msU', $output, $pres_clean);
+				preg_match_all('{<code.+</code>}msU', $output, $codes_clean);
+				preg_match_all('{<textarea.+</textarea>}msU', $output, $textareas_clean);
+				preg_match_all('{<script.+</script>}msU', $output, $javascript_clean);
+
+				// Minify the CSS in all the <style> tags.
+				preg_match_all('{<style.+</style>}msU', $output, $style_clean);
+				foreach ($style_clean[0] as $s)
+				{
+					$output = str_replace($s, $this->_minify_script_style($s, TRUE), $output);
+				}
+
+				// Minify the javascript in <script> tags.
+				foreach ($javascript_clean[0] as $s)
+				{
+					$javascript_mini[] = $this->_minify_script_style($s, TRUE);
+				}
+
+				// Replace multiple spaces with a single space.
+				$output = preg_replace('!\s{2,}!', ' ', $output);
+
+				// Remove comments (non-MSIE conditionals)
+				$output = preg_replace('{\s*<!--[^\[<>].*(?<!!)-->\s*}msU', '', $output);
+
+				// Remove spaces around block-level elements.
+				$output = preg_replace('/\s*(<\/?(html|head|title|meta|script|link|style|body|table|thead|tbody|tfoot|tr|th|td|h[1-6]|div|p|br)[^>]*>)\s*/is', '$1', $output);
+
+				// Replace mangled <pre> etc. tags with unprocessed ones.
+
+				if ( ! empty($pres_clean))
+				{
+					preg_match_all('{<pre.+</pre>}msU', $output, $pres_messed);
+					$output = str_replace($pres_messed[0], $pres_clean[0], $output);
+				}
+
+				if ( ! empty($codes_clean))
+				{
+					preg_match_all('{<code.+</code>}msU', $output, $codes_messed);
+					$output = str_replace($codes_messed[0], $codes_clean[0], $output);
+				}
+
+				if ( ! empty($textareas_clean))
+				{
+					preg_match_all('{<textarea.+</textarea>}msU', $output, $textareas_messed);
+					$output = str_replace($textareas_messed[0], $textareas_clean[0], $output);
+				}
+
+				if (isset($javascript_mini))
+				{
+					preg_match_all('{<script.+</script>}msU', $output, $javascript_messed);
+					$output = str_replace($javascript_messed[0], $javascript_mini, $output);
+				}
+
+				$size_removed = $size_before - strlen($output);
+				$savings_percent = round(($size_removed / $size_before * 100));
+
+				log_message('debug', 'Minifier shaved '.($size_removed / 1000).'KB ('.$savings_percent.'%) off final HTML output.');
+
+			break;
+
+			case 'text/css':
+			case 'text/javascript':
+
+				$output = $this->_minify_script_style($output);
+
+			break;
+
+			default: break;
+		}
+
+		return $output;
+	}
+
+	// --------------------------------------------------------------------
+
+	/**
+	 * Minify Style and Script
+	 *
+	 * Reduce excessive size of CSS/JavaScript content.  To remove spaces this
+	 * script walks the string as an array and determines if the pointer is inside
+	 * a string created by single quotes or double quotes.  spaces inside those
+	 * strings are not stripped.  Opening and closing tags are severed from
+	 * the string initially and saved without stripping whitespace to preserve
+	 * the tags and any associated properties if tags are present
+	 *
+	 * Minification logic/workflow is similar to methods used by Douglas Crockford
+	 * in JSMIN. http://www.crockford.com/javascript/jsmin.html
+	 *
+	 * KNOWN ISSUE: ending a line with a closing parenthesis ')' and no semicolon
+	 * where there should be one will break the Javascript. New lines after a
+	 * closing parenthesis are not recognized by the script. For best results
+	 * be sure to terminate lines with a semicolon when appropriate.
+	 *
+	 * @param	string	$output		Output to minify
+	 * @param	bool	$has_tags	Specify if the output has style or script tags
+	 * @return	string	Minified output
+	 */
+	protected function _minify_script_style($output, $has_tags = FALSE)
+	{
+		// We only need this if there are tags in the file
+		if ($has_tags === TRUE)
+		{
+			// Remove opening tag and save for later
+			$pos = strpos($output, '>') + 1;
+			$open_tag = substr($output, 0, $pos);
+			$output = substr_replace($output, '', 0, $pos);
+
+			// Remove closing tag and save it for later
+			$end_pos = strlen($output);
+			$pos = strpos($output, '</');
+			$closing_tag = substr($output, $pos, $end_pos);
+			$output = substr_replace($output, '', $pos);
+		}
+
+		// Remove CSS comments
+		$output = preg_replace('!/\*[^*]*\*+([^/][^*]*\*+)*/!i', '', $output);
+
+		// Remove spaces around curly brackets, colons,
+		// semi-colons, parenthesis, commas
+		$output = preg_replace('!\s*(:|;|,|}|{|\(|\))\s*!i', '$1', $output);
+
+		// Replace tabs with spaces
+		// Replace carriage returns & multiple new lines with single new line
+		// and trim any leading or trailing whitespace
+		$output = trim(preg_replace(array('/\t+/', '/\r/', '/\n+/'), array(' ', "\n", "\n"), $output));
+
+		// Remove spaces when safe to do so.
+		$in_string = $in_dstring = $prev = FALSE;
+		$array_output = str_split($output);
+		foreach ($array_output as $key => $value)
+		{
+			if ($in_string === FALSE && $in_dstring === FALSE)
+			{
+				if ($value === ' ')
+				{
+					// Get the next element in the array for comparisons
+					$next = $array_output[$key + 1];
+
+					// Strip spaces preceded/followed by a non-ASCII character
+					// or not preceded/followed by an alphanumeric
+					// or not preceded/followed \ $ and _
+					if ((preg_match('/^[\x20-\x7f]*$/D', $next) OR preg_match('/^[\x20-\x7f]*$/D', $prev))
+						&& ( ! ctype_alnum($next) OR ! ctype_alnum($prev))
+						&& ! in_array($next, array('\\', '_', '$'), TRUE)
+						&& ! in_array($prev, array('\\', '_', '$'), TRUE)
+					)
+					{
+						unset($array_output[$key]);
+					}
+				}
+				else
+				{
+					// Save this value as previous for the next iteration
+					// if it is not a blank space
+					$prev = $value;
+				}
+			}
+
+			if ($value === "'")
+			{
+				$in_string = ! $in_string;
+			}
+			elseif ($value === '"')
+			{
+				$in_dstring = ! $in_dstring;
+			}
+		}
+
+		// Put the string back together after spaces have been stripped
+		$output = implode($array_output);
+
+		// Remove new line characters unless previous or next character is
+		// printable or Non-ASCII
+		preg_match_all('/[\n]/', $output, $lf, PREG_OFFSET_CAPTURE);
+		$removed_lf = 0;
+		foreach ($lf as $feed_position)
+		{
+			foreach ($feed_position as $position)
+			{
+				$position = $position[1] - $removed_lf;
+				$next = $output[$position + 1];
+				$prev = $output[$position - 1];
+				if ( ! ctype_print($next) && ! ctype_print($prev)
+					&& ! preg_match('/^[\x20-\x7f]*$/D', $next)
+					&& ! preg_match('/^[\x20-\x7f]*$/D', $prev)
+				)
+				{
+					$output = substr_replace($output, '', $position, 1);
+					$removed_lf++;
+				}
+			}
+		}
+
+		// Put the opening and closing tags back if applicable
+		return isset($open_tag)
+			? $open_tag.$output.$closing_tag
+			: $output;
+	}
 }
 // END Output Class
 
